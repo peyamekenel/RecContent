@@ -1,0 +1,526 @@
+import argparse
+import json
+import os
+from typing import Dict, List, Any, Tuple, Optional
+import hashlib
+import math
+import random
+import time
+
+import numpy as np
+from numpy.typing import NDArray
+import pandas as pd
+try:
+    import faiss  # type: ignore
+except Exception:
+    faiss = None
+
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:
+    SentenceTransformer = None
+
+
+def _cache_paths(json_path: str) -> Tuple[str, str, str]:
+    base = os.path.splitext(json_path)[0] + "_embedding_cache"
+    return base + ".npz", base + "_ann.faiss", base + "_ann_ids.npy"
+
+
+def load_catalog(json_path: str) -> List[Dict[str, Any]]:
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "items" in data and isinstance(data["items"], list):
+        return data["items"]
+    if isinstance(data, list):
+        return data
+    raise ValueError(f"Unsupported JSON structure in {json_path}. Expected a list or an object with key 'items' being a list.")
+
+
+def _genres_to_str(genres_val: Any) -> str:
+    if isinstance(genres_val, list):
+        names: List[str] = []
+        for g in genres_val:
+            if isinstance(g, dict) and "Name" in g and g["Name"] is not None:
+                names.append(str(g["Name"]))
+            elif g is not None:
+                names.append(str(g))
+        return ", ".join(names)
+    if isinstance(genres_val, str):
+        return genres_val
+    if isinstance(genres_val, dict) and "Name" in genres_val:
+        return str(genres_val.get("Name") or "")
+    return ""
+
+
+def generate_embeddings(
+    catalog: List[Dict[str, Any]],
+    json_path: str,
+    model_name: str = "sentence-transformers/all-MPNet-base-v2",
+    genre_weight: float = 0.6,
+    description_weight: float = 0.4,
+) -> Tuple[Dict[str, NDArray[np.float32]], Dict[str, Dict[str, Any]]]:
+    if SentenceTransformer is None:
+        raise ImportError("sentence-transformers is not installed. Please install it before running.")
+
+    if genre_weight < 0 or description_weight < 0 or (genre_weight + description_weight) <= 0:
+        raise ValueError("genre_weight and description_weight must be >=0 and their sum > 0.")
+
+    cache_path, _, _ = _cache_paths(json_path)
+
+    embedding_dim: Optional[int] = None
+    id_to_item: Dict[str, Dict[str, Any]] = {}
+
+    ids: List[str] = []
+    genre_texts: List[str] = []
+    description_texts: List[str] = []
+    item_hashes: List[str] = []
+
+    for it in catalog:
+        item_id = it.get("Id") or it.get("id") or it.get("ID")
+        if item_id is None:
+            continue
+        item_id = str(item_id)
+
+        title = str(it.get("Title") or it.get("title") or "").strip()
+        genres_str = _genres_to_str(it.get("Genres"))
+        description = str(it.get("Description") or it.get("description") or title).strip()
+
+        if not genres_str and not description:
+            continue
+
+        id_to_item[item_id] = it
+        ids.append(item_id)
+        genre_texts.append(genres_str if genres_str else "")
+        description_texts.append(description if description else "")
+
+        h = hashlib.sha1()
+        h.update(model_name.encode("utf-8"))
+        h.update(
+            b"|gw=" + repr(genre_weight).encode("utf-8")
+            + b"|dw=" + repr(description_weight).encode("utf-8")
+        )
+        h.update(b"|genres:" + genres_str.lower().strip().encode("utf-8"))
+        h.update(b"|description:" + description.lower().strip().encode("utf-8"))
+        item_hashes.append(h.hexdigest())
+
+    if not ids:
+        return {}, {}
+
+    cached_vectors: Dict[str, NDArray[np.float32]] = {}
+    cached_hashes: Dict[str, str] = {}
+    if os.path.exists(cache_path):
+        try:
+            with np.load(cache_path, allow_pickle=False, mmap_mode="r") as npz:
+                cached_ids = npz["ids"].astype(str)
+                cached_emb = np.asarray(npz["embeddings"], dtype=np.float32)
+                cached_h = npz["hashes"].astype(str)
+                
+
+                if set(cached_ids) == set(ids):
+                    for i, cid in enumerate(cached_ids):
+                        cached_vectors[cid] = cached_emb[i]
+                        cached_hashes[cid] = cached_h[i]
+                    if cached_emb is not None:
+                        embedding_dim = int(cached_emb.shape[1])
+                else:
+                    print("Cache is stale (ID mismatch). Recomputing all embeddings.")
+                    cached_vectors = {}
+                    cached_hashes = {}
+        except Exception:
+            # Önbellek bozuksa, yok say ve devam et
+            cached_vectors = {}
+            cached_hashes = {}
+
+    to_compute_indices: List[int] = []
+    reused_vectors: Dict[int, NDArray[np.float32]] = {}
+    for i, item_id in enumerate(ids):
+        prev_h = cached_hashes.get(item_id)
+        if prev_h is not None and prev_h == item_hashes[i] and item_id in cached_vectors:
+            reused_vectors[i] = cached_vectors[item_id]
+        else:
+            to_compute_indices.append(i)
+
+    model = None
+    if to_compute_indices:
+        print(f"Computing embeddings for {len(to_compute_indices)} items...")
+        model = SentenceTransformer(model_name)
+        embedding_dim = model.get_sentence_embedding_dimension() if embedding_dim is None else embedding_dim
+
+    new_vectors: Dict[int, NDArray[np.float32]] = {}
+    if to_compute_indices:
+        subset_genres = [genre_texts[i] for i in to_compute_indices]
+        subset_descs  = [description_texts[i] for i in to_compute_indices]
+
+        if model is None:
+            raise RuntimeError("Internal error: model not initialized despite pending items to encode.")
+        g_emb = model.encode(subset_genres, show_progress_bar=False, convert_to_numpy=True, normalize_embeddings=False)
+        d_emb = model.encode(subset_descs,  show_progress_bar=False, convert_to_numpy=True, normalize_embeddings=False)
+
+        for j, idx in enumerate(to_compute_indices):
+            g_vec = g_emb[j]
+            d_vec = d_emb[j]
+            
+            g_norm_val = np.linalg.norm(g_vec)
+            g_norm = g_vec / g_norm_val if g_norm_val > 0 else g_vec
+
+            d_norm_val = np.linalg.norm(d_vec)
+            d_norm = d_vec / d_norm_val if d_norm_val > 0 else d_vec
+
+            combined = (genre_weight * g_norm) + (description_weight * d_norm)
+            
+            combined_norm_val = np.linalg.norm(combined)
+            if combined_norm_val > 0:
+                combined = combined / combined_norm_val
+            
+            new_vectors[idx] = combined.astype(np.float32)
+
+    embeddings: Dict[str, NDArray[np.float32]] = {}
+    final_matrix: List[NDArray[np.float32]] = []
+    for i, item_id in enumerate(ids):
+        vec = reused_vectors.get(i) if i in reused_vectors else new_vectors.get(i)
+        if vec is None:
+            dim = int(embedding_dim) if embedding_dim is not None else 768
+            vec = np.zeros((dim,), dtype=np.float32)
+        embeddings[item_id] = vec
+        final_matrix.append(vec)
+
+    if to_compute_indices:
+        try:
+            np.savez_compressed(
+                cache_path,
+                ids=np.array(ids),
+                embeddings=np.stack(final_matrix, axis=0),
+                hashes=np.array(item_hashes),
+            )
+        except Exception:
+            pass
+
+    return embeddings, id_to_item
+
+
+def _build_or_load_ann(cache_path: str, embeddings: Dict[str, NDArray[np.float32]]) -> Tuple[Any, List[str]]:
+
+    ids = sorted(embeddings.keys())
+    
+    if not ids:
+        return None, []
+    ann_path = os.path.splitext(cache_path)[0] + "_ann.faiss"
+    ids_path = os.path.splitext(cache_path)[0] + "_ann_ids.npy"
+    mat = np.stack([embeddings[i] for i in ids], axis=0).astype(np.float32)
+    if faiss is None:
+        return None, ids
+    d = mat.shape[1]
+    if os.path.exists(ann_path) and os.path.exists(ids_path):
+        try:
+            saved_ids = np.load(ids_path, allow_pickle=False).astype(str).tolist()
+            if saved_ids == ids:
+                index = faiss.read_index(ann_path)
+                if getattr(index, "d", None) == d:
+                    return index, saved_ids
+        except Exception:
+            pass
+    index = faiss.IndexFlatIP(d)
+    index.add(mat)
+    try:
+        faiss.write_index(index, ann_path)
+        np.save(ids_path, np.array(ids))
+    except Exception:
+        pass
+    return index, ids
+def _genres_to_list(genres_val: Any) -> List[str]:
+    s = _genres_to_str(genres_val)
+    if not s:
+        return []
+    return [p.strip() for p in s.split(",") if p and p.strip()]
+
+def _build_rec(iid: str, item_data: Dict[str, Any], score: float) -> Dict[str, Any]:
+    title = str(item_data.get("Title") or item_data.get("title") or "")
+    return {
+        "Id": iid,
+        "Title": title,
+        "Genres": _genres_to_list(item_data.get("Genres")),
+        "Score": float(score),
+    }
+
+
+
+def get_embedding_based_recommendations(
+    seed_id: str,
+    id_to_item: Dict[str, Dict[str, Any]],
+    embeddings: Dict[str, NDArray[np.float32]],
+    k: int = 10,
+) -> List[Dict[str, Any]]:
+    if seed_id not in embeddings:
+        raise ValueError(f"seed_id '{seed_id}' not found in embeddings.")
+
+    seed_vec = embeddings[seed_id].reshape(1, -1)
+
+    ids: List[str] = [iid for iid in embeddings.keys() if iid != seed_id]
+    if not ids:
+        return []
+
+    mat = np.stack([embeddings[iid] for iid in ids], axis=0)
+    sims = (mat @ seed_vec.T).ravel()
+
+    k_eff = min(k, len(ids))
+    if k_eff <= 0:
+        return []
+    if k_eff < len(ids):
+        top_indices = np.argpartition(-sims, k_eff - 1)[:k_eff]
+        top_indices = top_indices[np.argsort(-sims[top_indices])]
+    else:
+        top_indices = np.argsort(-sims)
+
+    results: List[Dict[str, Any]] = []
+    for idx in top_indices:
+        iid = ids[idx]
+        item_data = id_to_item.get(iid, {})
+        results.append(_build_rec(iid, item_data, float(sims[idx])))
+    return results
+
+
+def get_embedding_based_recommendations_ann(
+    seed_id: str,
+    id_to_item: Dict[str, Dict[str, Any]],
+    embeddings: Dict[str, NDArray[np.float32]],
+    k: int,
+    cache_path: str,
+) -> List[Dict[str, Any]]:
+    if seed_id not in embeddings:
+        raise ValueError(f"seed_id '{seed_id}' not found in embeddings.")
+    ann_index, ann_ids = _build_or_load_ann(cache_path, embeddings)
+    if ann_index is None or len(ann_ids) != len(embeddings):
+        return get_embedding_based_recommendations(seed_id, id_to_item, embeddings, k=k)
+    
+    seed_vec = embeddings[seed_id].astype(np.float32).reshape(1, -1)
+    D, I = ann_index.search(seed_vec, min(k + 1, len(ann_ids)))
+    
+    results: List[Dict[str, Any]] = []
+    for idx, score in zip(I[0], D[0]):
+        if idx < 0:
+            continue
+            
+        iid = ann_ids[idx]
+        if iid == seed_id:
+            continue
+            
+        item_data = id_to_item.get(iid, {})
+        results.append(_build_rec(iid, item_data, float(score)))
+        
+        if len(results) >= k:
+            break
+            
+    return results
+def recommend_top_k(
+    seed_id: str,
+    id_to_item: Dict[str, Dict[str, Any]],
+    embeddings: Dict[str, NDArray[np.float32]],
+    k: int,
+    cache_path: str,
+) -> List[Dict[str, Any]]:
+    return get_embedding_based_recommendations_ann(
+        seed_id=seed_id,
+        id_to_item=id_to_item,
+        embeddings=embeddings,
+        k=k,
+        cache_path=cache_path,
+    )
+
+
+
+def evaluate_recommender(
+    embeddings: Dict[str, NDArray[np.float32]],
+    id_to_item: Dict[str, Dict[str, Any]],
+    interactions_path: str,
+    k: int = 10,
+    cache_path: str | None = None,
+) -> None:
+    col_names = [
+        "profileid", "contentid", "contenttype", "timestamp",
+        "episodecount", "wathcedcount", "applicationid", "deviceid",
+        "lang", "country",
+    ]
+    ann_index = None
+    ann_ids: List[str] = []
+    use_ann = False
+    if cache_path is not None:
+        ann_index, ann_ids = _build_or_load_ann(cache_path, embeddings)
+        use_ann = ann_index is not None and len(ann_ids) == len(embeddings)
+
+    df = pd.read_csv(interactions_path, header=None, names=col_names)
+    df = df[["profileid", "contentid"]].dropna()
+    df["profileid"] = df["profileid"].astype(str)
+    df["contentid"] = df["contentid"].astype(str)
+
+    user_to_items: Dict[str, set] = {}
+    for uid, cid in zip(df["profileid"].values, df["contentid"].values):
+        s = user_to_items.get(uid)
+        if s is None:
+            s = set()
+            user_to_items[uid] = s
+        s.add(cid)
+
+    eligible = {u: items for u, items in user_to_items.items() if len(items) >= 5}
+    if not eligible:
+        print("No eligible users (>=5 interactions) found for evaluation.")
+        return
+
+    def dcg(rec_ids: List[str], relevant: set, k: int) -> float:
+        score = 0.0
+        for i, rid in enumerate(rec_ids[:k], start=1):
+            if rid in relevant:
+                score += 1.0 / math.log2(i + 1)
+        return score
+
+    def idcg(num_relevant: int, k: int) -> float:
+        max_hits = min(k, num_relevant)
+        return sum(1.0 / math.log2(i + 1) for i in range(1, max_hits + 1))
+
+    precisions: List[float] = []
+    recalls: List[float] = []
+    ndcgs: List[float] = []
+
+    for user, items in eligible.items():
+        seed_id = random.choice(list(items))
+        relevant = items - {seed_id}
+
+        if seed_id not in embeddings:
+            continue
+
+        relevant_in_catalog = relevant.intersection(embeddings.keys())
+        if not relevant_in_catalog:
+            # Değerlendirilecek geçerli bir öğe yoksa bu kullanıcıyı atla
+            continue
+
+        if use_ann and ann_index is not None:
+            seed_vec = embeddings[seed_id].astype(np.float32).reshape(1, -1)
+            D, I = ann_index.search(seed_vec, min(k + 1, len(ann_ids)))
+            idxs = [i for i in I[0].tolist() if i >= 0]
+            rec_ids = []
+            for idx in idxs:
+                iid = ann_ids[idx]
+                if iid != seed_id:
+                    rec_ids.append(iid)
+                if len(rec_ids) >= k:
+                    break
+        else:
+            recs = get_embedding_based_recommendations(seed_id, id_to_item, embeddings, k=k)
+            rec_ids = [r["Id"] for r in recs]
+
+        hits = sum(1 for rid in rec_ids if rid in relevant_in_catalog)
+        prec = hits / float(k) if k > 0 else 0.0
+        rec = hits / float(len(relevant_in_catalog)) if len(relevant_in_catalog) > 0 else 0.0
+
+        dcg_val = dcg(rec_ids, relevant_in_catalog, k)
+        idcg_val = idcg(len(relevant_in_catalog), k)
+        ndcg = (dcg_val / idcg_val) if idcg_val > 0 else 0.0
+
+        precisions.append(prec)
+        recalls.append(rec)
+        ndcgs.append(ndcg)
+
+    if not precisions:
+        print("No users with seed items present in catalog; evaluation skipped.")
+        return
+
+    avg_p = float(np.mean(precisions))
+    avg_r = float(np.mean(recalls))
+    avg_n = float(np.mean(ndcgs))
+
+    print("Evaluation summary (averaged across users):")
+    print(f"- Users evaluated: {len(precisions)}")
+    print(f"- Precision@{k}: {avg_p:.4f}")
+    print(f"- Recall@{k}:    {avg_r:.4f}")
+    print(f"- NDCG@{k}:      {avg_n:.4f}")
+
+
+def pick_default_seed(embeddings: Dict[str, NDArray[np.float32]]) -> str:
+    for iid in sorted(embeddings.keys()):
+        return iid
+    raise ValueError("No items available to pick a default seed.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Embedding-based content recommender using Description + Genres.")
+    parser.add_argument("--data", required=True, help="Path to JSON file (e.g., 'all 1.json').")
+    parser.add_argument("--seed", required=False, help="Seed item Id. If not provided, picks the first available.")
+    parser.add_argument("--k", type=int, default=10, help="Number of recommendations to return.")
+    parser.add_argument("--save", required=False, help="Optional path to save computed embeddings as .npz.")
+    parser.add_argument("--interactions", required=False, help="Path to interactions CSV (no header). When provided, run evaluation mode.")
+    parser.add_argument("--model-name", required=False, default="sentence-transformers/all-MPNet-base-v2", help="SentenceTransformer model to use.")
+    parser.add_argument("--genre-weight", type=float, default=0.6, help="Weight for genre embeddings.")
+    parser.add_argument("--desc-weight", type=float, default=0.4, help="Weight for description embeddings.")
+    args = parser.parse_args()
+    if args.k <= 0:
+        raise ValueError("k must be > 0.")
+
+    catalog = load_catalog(args.data)
+    embeddings, id_to_item = generate_embeddings(
+        catalog,
+        json_path=args.data,
+        model_name=args.model_name,
+        genre_weight=args.genre_weight,
+        description_weight=args.desc_weight,
+    )
+
+    if not embeddings:
+        raise RuntimeError("No embeddings were generated. Check that items have Title and/or Genres.")
+
+    if args.interactions:
+        cache_path, _, _ = _cache_paths(args.data)
+        evaluate_recommender(
+            embeddings=embeddings,
+            id_to_item=id_to_item,
+            interactions_path=args.interactions,
+            k=args.k,
+            cache_path=cache_path,
+        )
+        if args.save:
+            save_dir = os.path.dirname(args.save)
+            if save_dir:
+                os.makedirs(save_dir, exist_ok=True)
+            ids = list(embeddings.keys())
+            mat = np.stack([embeddings[i] for i in ids], axis=0)
+            np.savez_compressed(args.save, ids=np.array(ids), embeddings=mat)
+            print(f"Saved embeddings to: {args.save}")
+        return
+
+    seed_id = args.seed or pick_default_seed(embeddings)
+
+    cache_path, _, _ = _cache_paths(args.data)
+    recs = recommend_top_k(
+        seed_id=seed_id,
+        id_to_item=id_to_item,
+        embeddings=embeddings,
+        k=args.k,
+        cache_path=cache_path,
+    )
+
+    seed_title = id_to_item.get(seed_id, {}).get("Title", "N/A")
+    print(f"Seed Item: '{seed_title}' (Id: {seed_id})")
+    print("Top recommendations:")
+    for r in recs:
+        genres_val = r.get("Genres", [])
+        if isinstance(genres_val, list):
+            genres_str = ", ".join(genres_val)
+        else:
+            genres_str = str(genres_val)
+        print(f"- Id: {r['Id']:<10} | Title: {r['Title']:<40} | Genres: {genres_str:<30} | Score: {r['Score']:.5f}")
+
+    if args.save:
+        save_dir = os.path.dirname(args.save)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+        ids = list(embeddings.keys())
+        mat = np.stack([embeddings[i] for i in ids], axis=0)
+        np.savez_compressed(args.save, ids=np.array(ids), embeddings=mat)
+        print(f"Saved embeddings to: {args.save}")
+
+
+if __name__ == "__main__":
+    start_time = time.perf_counter()
+    try:
+        main()
+    finally:
+        elapsed = time.perf_counter() - start_time
+        print(f"\nElapsed time: {elapsed:.3f}s")

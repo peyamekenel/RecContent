@@ -1,0 +1,6 @@
+sentence-transformers
+numpy
+scikit-learn
+pandas
+# Optional acceleration (auto-fallback without it):
+# faiss-cpu
