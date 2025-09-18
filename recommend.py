@@ -52,6 +52,23 @@ def _genres_to_str(genres_val: Any) -> str:
     return ""
 
 
+def genres_to_list(genres_val: Any) -> List[str]:
+    if isinstance(genres_val, list):
+        out: List[str] = []
+        for g in genres_val:
+            if isinstance(g, dict) and "Name" in g and g["Name"] is not None:
+                out.append(str(g["Name"]))
+            elif g is not None:
+                out.append(str(g))
+        return out
+    if isinstance(genres_val, str):
+        return [genres_val] if genres_val else []
+    if isinstance(genres_val, dict) and "Name" in genres_val:
+        name = genres_val.get("Name")
+        return [str(name)] if name else []
+    return []
+
+
 def generate_embeddings(
     catalog: List[Dict[str, Any]],
     json_path: str,
@@ -115,7 +132,9 @@ def generate_embeddings(
                 cached_emb = np.asarray(npz["embeddings"], dtype=np.float32)
                 cached_h = npz["hashes"].astype(str)
                 
-
+                # UYGULANAN DÜZELTME (Madde 1.4): Kısmi veya eski önbelleği kontrol et.
+                # Eğer önbellekteki ID seti, güncel katalogdaki ID setiyle tam olarak
+                # eşleşmiyorsa, önbelleği geçersiz say.
                 if set(cached_ids) == set(ids):
                     for i, cid in enumerate(cached_ids):
                         cached_vectors[cid] = cached_emb[i]
@@ -179,7 +198,7 @@ def generate_embeddings(
     for i, item_id in enumerate(ids):
         vec = reused_vectors.get(i) if i in reused_vectors else new_vectors.get(i)
         if vec is None:
-            dim = int(embedding_dim) if embedding_dim is not None else 768
+            dim = int(embedding_dim) if embedding_dim is not None else 384
             vec = np.zeros((dim,), dtype=np.float32)
         embeddings[item_id] = vec
         final_matrix.append(vec)
@@ -198,14 +217,14 @@ def generate_embeddings(
     return embeddings, id_to_item
 
 
-def _build_or_load_ann(cache_path: str, embeddings: Dict[str, NDArray[np.float32]]) -> Tuple[Any, List[str]]:
-
+def _build_or_load_ann(json_path: str, embeddings: Dict[str, NDArray[np.float32]]) -> Tuple[Any, List[str]]:
+    # UYGULANAN DÜZELTME (Madde 1.3): ID'ler sıralanarak önbellek tutarlılığı sağlanır.
+    # Bu, FAISS indeksinin ve ID listesinin her zaman aynı sırada olmasını garanti eder.
     ids = sorted(embeddings.keys())
     
     if not ids:
         return None, []
-    ann_path = os.path.splitext(cache_path)[0] + "_ann.faiss"
-    ids_path = os.path.splitext(cache_path)[0] + "_ann_ids.npy"
+    _, ann_path, ids_path = _cache_paths(json_path)
     mat = np.stack([embeddings[i] for i in ids], axis=0).astype(np.float32)
     if faiss is None:
         return None, ids
@@ -227,21 +246,6 @@ def _build_or_load_ann(cache_path: str, embeddings: Dict[str, NDArray[np.float32
     except Exception:
         pass
     return index, ids
-def _genres_to_list(genres_val: Any) -> List[str]:
-    s = _genres_to_str(genres_val)
-    if not s:
-        return []
-    return [p.strip() for p in s.split(",") if p and p.strip()]
-
-def _build_rec(iid: str, item_data: Dict[str, Any], score: float) -> Dict[str, Any]:
-    title = str(item_data.get("Title") or item_data.get("title") or "")
-    return {
-        "Id": iid,
-        "Title": title,
-        "Genres": _genres_to_list(item_data.get("Genres")),
-        "Score": float(score),
-    }
-
 
 
 def get_embedding_based_recommendations(
@@ -275,7 +279,16 @@ def get_embedding_based_recommendations(
     for idx in top_indices:
         iid = ids[idx]
         item_data = id_to_item.get(iid, {})
-        results.append(_build_rec(iid, item_data, float(sims[idx])))
+        title = str(item_data.get("Title") or item_data.get("title") or "")
+        
+        genres_list: List[str] = genres_to_list(item_data.get("Genres"))
+        
+        results.append({
+            "Id": iid,
+            "Title": title,
+            "Genres": genres_list,
+            "Score": float(sims[idx]),
+        })
     return results
 
 
@@ -284,11 +297,11 @@ def get_embedding_based_recommendations_ann(
     id_to_item: Dict[str, Dict[str, Any]],
     embeddings: Dict[str, NDArray[np.float32]],
     k: int,
-    cache_path: str,
+    json_path: str,
 ) -> List[Dict[str, Any]]:
     if seed_id not in embeddings:
         raise ValueError(f"seed_id '{seed_id}' not found in embeddings.")
-    ann_index, ann_ids = _build_or_load_ann(cache_path, embeddings)
+    ann_index, ann_ids = _build_or_load_ann(json_path, embeddings)
     if ann_index is None or len(ann_ids) != len(embeddings):
         return get_embedding_based_recommendations(seed_id, id_to_item, embeddings, k=k)
     
@@ -305,27 +318,20 @@ def get_embedding_based_recommendations_ann(
             continue
             
         item_data = id_to_item.get(iid, {})
-        results.append(_build_rec(iid, item_data, float(score)))
+        title = str(item_data.get("Title") or item_data.get("title") or "")
+        genres_list: List[str] = genres_to_list(item_data.get("Genres"))
+            
+        results.append({
+            "Id": iid,
+            "Title": title,
+            "Genres": genres_list,
+            "Score": float(score),
+        })
         
         if len(results) >= k:
             break
             
     return results
-def recommend_top_k(
-    seed_id: str,
-    id_to_item: Dict[str, Dict[str, Any]],
-    embeddings: Dict[str, NDArray[np.float32]],
-    k: int,
-    cache_path: str,
-) -> List[Dict[str, Any]]:
-    return get_embedding_based_recommendations_ann(
-        seed_id=seed_id,
-        id_to_item=id_to_item,
-        embeddings=embeddings,
-        k=k,
-        cache_path=cache_path,
-    )
-
 
 
 def evaluate_recommender(
@@ -333,7 +339,7 @@ def evaluate_recommender(
     id_to_item: Dict[str, Dict[str, Any]],
     interactions_path: str,
     k: int = 10,
-    cache_path: str | None = None,
+    json_path: str | None = None,
 ) -> None:
     col_names = [
         "profileid", "contentid", "contenttype", "timestamp",
@@ -343,8 +349,8 @@ def evaluate_recommender(
     ann_index = None
     ann_ids: List[str] = []
     use_ann = False
-    if cache_path is not None:
-        ann_index, ann_ids = _build_or_load_ann(cache_path, embeddings)
+    if json_path is not None:
+        ann_index, ann_ids = _build_or_load_ann(json_path, embeddings)
         use_ann = ann_index is not None and len(ann_ids) == len(embeddings)
 
     df = pd.read_csv(interactions_path, header=None, names=col_names)
@@ -387,6 +393,9 @@ def evaluate_recommender(
         if seed_id not in embeddings:
             continue
 
+        # UYGULANAN DÜZELTME (Madde 1.6): "İlgili" öğeleri, sadece katalogda
+        # (ve dolayısıyla embedding'i olanlar) var olanlarla sınırla.
+        # Bu, metriklerin doğru hesaplanmasını sağlar.
         relevant_in_catalog = relevant.intersection(embeddings.keys())
         if not relevant_in_catalog:
             # Değerlendirilecek geçerli bir öğe yoksa bu kullanıcıyı atla
@@ -435,6 +444,7 @@ def evaluate_recommender(
 
 
 def pick_default_seed(embeddings: Dict[str, NDArray[np.float32]]) -> str:
+    # Daha deterministik bir başlangıç noktası için sıralı anahtarlardan ilkini al
     for iid in sorted(embeddings.keys()):
         return iid
     raise ValueError("No items available to pick a default seed.")
@@ -451,8 +461,6 @@ def main():
     parser.add_argument("--genre-weight", type=float, default=0.6, help="Weight for genre embeddings.")
     parser.add_argument("--desc-weight", type=float, default=0.4, help="Weight for description embeddings.")
     args = parser.parse_args()
-    if args.k <= 0:
-        raise ValueError("k must be > 0.")
 
     catalog = load_catalog(args.data)
     embeddings, id_to_item = generate_embeddings(
@@ -467,18 +475,14 @@ def main():
         raise RuntimeError("No embeddings were generated. Check that items have Title and/or Genres.")
 
     if args.interactions:
-        cache_path, _, _ = _cache_paths(args.data)
         evaluate_recommender(
             embeddings=embeddings,
             id_to_item=id_to_item,
             interactions_path=args.interactions,
             k=args.k,
-            cache_path=cache_path,
+            json_path=args.data,
         )
         if args.save:
-            save_dir = os.path.dirname(args.save)
-            if save_dir:
-                os.makedirs(save_dir, exist_ok=True)
             ids = list(embeddings.keys())
             mat = np.stack([embeddings[i] for i in ids], axis=0)
             np.savez_compressed(args.save, ids=np.array(ids), embeddings=mat)
@@ -487,13 +491,12 @@ def main():
 
     seed_id = args.seed or pick_default_seed(embeddings)
 
-    cache_path, _, _ = _cache_paths(args.data)
-    recs = recommend_top_k(
+    recs = get_embedding_based_recommendations_ann(
         seed_id=seed_id,
         id_to_item=id_to_item,
         embeddings=embeddings,
         k=args.k,
-        cache_path=cache_path,
+        json_path=args.data,
     )
 
     seed_title = id_to_item.get(seed_id, {}).get("Title", "N/A")
@@ -508,9 +511,6 @@ def main():
         print(f"- Id: {r['Id']:<10} | Title: {r['Title']:<40} | Genres: {genres_str:<30} | Score: {r['Score']:.5f}")
 
     if args.save:
-        save_dir = os.path.dirname(args.save)
-        if save_dir:
-            os.makedirs(save_dir, exist_ok=True)
         ids = list(embeddings.keys())
         mat = np.stack([embeddings[i] for i in ids], axis=0)
         np.savez_compressed(args.save, ids=np.array(ids), embeddings=mat)
