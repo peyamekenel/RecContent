@@ -1,4 +1,4 @@
-# RecTask – Content-based Recommender with Sentence Embeddings
+# RecContent– Content-based Recommender with Sentence Embeddings
 
 This repository provides a simple content-based recommendation system using sentence embeddings from `sentence-transformers/all-MPNet-base-v2`.
 
