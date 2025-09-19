@@ -181,26 +181,26 @@ def generate_embeddings(
     if not ids:
         return {}, {}
 
-    cached_ids_arr: Optional[np.ndarray] = None
+    cached_ids_list: Optional[List[str]] = None
     cached_emb: Optional[np.ndarray] = None
     cached_h: Optional[np.ndarray] = None
     if os.path.exists(cache_path):
         try:
             with np.load(cache_path, allow_pickle=False, mmap_mode="r") as npz:
-                cached_ids_arr = npz["ids"].astype(str).tolist()
+                cached_ids_list = npz["ids"].astype(str).tolist()
                 cached_emb = np.asarray(npz["embeddings"], dtype=np.float32)
                 cached_h = npz["hashes"].astype(str)
                 if cached_emb is not None:
                     embedding_dim = int(cached_emb.shape[1])
         except Exception:
-            cached_ids_arr = None
+            cached_ids_list = None
             cached_emb = None
             cached_h = None
 
     to_compute_indices: List[int] = []
     reused_vectors: Dict[int, NDArray[np.float32]] = {}
-    if cached_ids_arr is not None and cached_emb is not None and cached_h is not None:
-        id_to_pos = {str(cid): i for i, cid in enumerate(cached_ids_arr)}
+    if cached_ids_list is not None and cached_emb is not None and cached_h is not None:
+        id_to_pos = {str(cid): i for i, cid in enumerate(cached_ids_list)}
         for i, item_id in enumerate(ids):
             pos = id_to_pos.get(item_id)
             if pos is not None and cached_h[pos] == item_hashes[i]:
@@ -320,7 +320,6 @@ def get_embedding_based_recommendations_ann(
     if ann_index is None or len(ann_ids) != len(embeddings):
         raise RuntimeError("FAISS index is unavailable or inconsistent. Ensure 'faiss-cpu' is installed and rebuild the index.")
     
-    seed_vec = embeddings[seed_id].astype(np.float32).reshape(1, -1)
     pairs = ann_topk_with_scores(embeddings, ann_index, ann_ids, seed_id, k)
     results: List[Dict[str, Any]] = []
     for iid, score in pairs:
@@ -420,7 +419,6 @@ def evaluate_recommender(
 
 
 def pick_default_seed(embeddings: Dict[str, NDArray[np.float32]]) -> str:
-    # Daha deterministik bir başlangıç noktası için sıralı anahtarlardan ilkini al
     for iid in sorted(embeddings.keys()):
         return iid
     raise ValueError("No items available to pick a default seed.")
@@ -498,4 +496,3 @@ if __name__ == "__main__":
     finally:
         elapsed = time.perf_counter() - start_time
         print(f"\nElapsed time: {elapsed:.3f}s")
-
