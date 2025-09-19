@@ -214,7 +214,7 @@ def _build_or_load_ann(cache_path: str, embeddings: Dict[str, NDArray[np.float32
     meta_path = _ann_meta_path_from_cache_path(cache_path)
     mat = np.stack([embeddings[i] for i in ids], axis=0).astype(np.float32)
     if faiss is None:
-        return None, ids
+        raise ImportError("FAISS is required but not installed. Please install 'faiss-cpu'.")
     d = mat.shape[1]
     digest = _matrix_digest(mat)
     if os.path.exists(ann_path) and os.path.exists(ids_path) and os.path.exists(meta_path):
@@ -236,64 +236,11 @@ def _build_or_load_ann(cache_path: str, embeddings: Dict[str, NDArray[np.float32
         np.save(ids_path, np.array(ids))
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump({"digest": digest, "d": d, "count": len(ids)}, f)
-    except Exception:
-        pass
+    except Exception as e:
+        raise RuntimeError(f"Failed to persist FAISS index: {e}")
     return index, ids
 
 
-def get_embedding_based_recommendations(
-    seed_id: str,
-    id_to_item: Dict[str, Dict[str, Any]],
-    embeddings: Dict[str, NDArray[np.float32]],
-    k: int = 10,
-) -> List[Dict[str, Any]]:
-    if seed_id not in embeddings:
-        raise ValueError(f"seed_id '{seed_id}' not found in embeddings.")
-
-    seed_vec = embeddings[seed_id].reshape(1, -1)
-
-    ids: List[str] = [iid for iid in embeddings.keys() if iid != seed_id]
-    if not ids:
-        return []
-
-    mat = np.stack([embeddings[iid] for iid in ids], axis=0)
-    sims = (mat @ seed_vec.T).ravel()
-
-    k_eff = min(k, len(ids))
-    if k_eff <= 0:
-        return []
-    if k_eff < len(ids):
-        top_indices = np.argpartition(-sims, k_eff - 1)[:k_eff]
-        top_indices = top_indices[np.argsort(-sims[top_indices])]
-    else:
-        top_indices = np.argsort(-sims)
-
-    results: List[Dict[str, Any]] = []
-    for idx in top_indices:
-        iid = ids[idx]
-        item_data = id_to_item.get(iid, {})
-        title = str(item_data.get("Title") or item_data.get("title") or "")
-        
-        genres_val = item_data.get("Genres")
-        genres_list: List[str] = []
-        if isinstance(genres_val, list):
-            for g in genres_val:
-                if isinstance(g, dict) and "Name" in g and g["Name"] is not None:
-                    genres_list.append(str(g["Name"]))
-                elif g is not None:
-                    genres_list.append(str(g))
-        elif isinstance(genres_val, str):
-            genres_list = [genres_val] if genres_val else []
-        elif isinstance(genres_val, dict) and "Name" in genres_val:
-            genres_list = [str(genres_val.get("Name"))] if genres_val.get("Name") else []
-        
-        results.append({
-            "Id": iid,
-            "Title": title,
-            "Genres": genres_list,
-            "Score": float(sims[idx]),
-        })
-    return results
 
 
 def get_embedding_based_recommendations_ann(
@@ -307,7 +254,7 @@ def get_embedding_based_recommendations_ann(
         raise ValueError(f"seed_id '{seed_id}' not found in embeddings.")
     ann_index, ann_ids = _build_or_load_ann(cache_path, embeddings)
     if ann_index is None or len(ann_ids) != len(embeddings):
-        return get_embedding_based_recommendations(seed_id, id_to_item, embeddings, k=k)
+        raise RuntimeError("FAISS index is unavailable or inconsistent. Ensure 'faiss-cpu' is installed and rebuild the index.")
     
     seed_vec = embeddings[seed_id].astype(np.float32).reshape(1, -1)
     D, I = ann_index.search(seed_vec, min(k + 1, len(ann_ids)))
@@ -361,12 +308,9 @@ def evaluate_recommender(
         "episodecount", "wathcedcount", "applicationid", "deviceid",
         "lang", "country",
     ]
-    ann_index = None
-    ann_ids: List[str] = []
-    use_ann = False
-    if cache_path is not None:
-        ann_index, ann_ids = _build_or_load_ann(cache_path, embeddings)
-        use_ann = ann_index is not None and len(ann_ids) == len(embeddings)
+    if cache_path is None:
+        cache_path, _, _ = _cache_paths(interactions_path)
+    ann_index, ann_ids = _build_or_load_ann(cache_path, embeddings)
 
     df = pd.read_csv(interactions_path, header=None, names=col_names)
     df = df[["profileid", "contentid"]].dropna()
@@ -411,20 +355,16 @@ def evaluate_recommender(
         if not relevant_in_catalog:
             continue
 
-        if use_ann and ann_index is not None:
-            seed_vec = embeddings[seed_id].astype(np.float32).reshape(1, -1)
-            D, I = ann_index.search(seed_vec, min(k + 1, len(ann_ids)))
-            idxs = [i for i in I[0].tolist() if i >= 0]
-            rec_ids = []
-            for idx in idxs:
-                iid = ann_ids[idx]
-                if iid != seed_id:
-                    rec_ids.append(iid)
-                if len(rec_ids) >= k:
-                    break
-        else:
-            recs = get_embedding_based_recommendations(seed_id, id_to_item, embeddings, k=k)
-            rec_ids = [r["Id"] for r in recs]
+        seed_vec = embeddings[seed_id].astype(np.float32).reshape(1, -1)
+        D, I = ann_index.search(seed_vec, min(k + 1, len(ann_ids)))
+        idxs = [i for i in I[0].tolist() if i >= 0]
+        rec_ids = []
+        for idx in idxs:
+            iid = ann_ids[idx]
+            if iid != seed_id:
+                rec_ids.append(iid)
+            if len(rec_ids) >= k:
+                break
 
         hits = sum(1 for rid in rec_ids if rid in relevant_in_catalog)
         prec = hits / float(k) if k > 0 else 0.0
