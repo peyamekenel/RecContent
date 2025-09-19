@@ -26,6 +26,17 @@ def _cache_paths(json_path: str) -> Tuple[str, str, str]:
     return base + ".npz", base + "_ann.faiss", base + "_ann_ids.npy"
 
 
+def _ann_meta_path_from_cache_path(cache_path: str) -> str:
+    base, _ = os.path.splitext(cache_path)
+    return base + "_ann_meta.json"
+
+
+def _matrix_digest(mat: np.ndarray) -> str:
+    h = hashlib.sha1()
+    h.update(np.ascontiguousarray(mat.astype(np.float32)).tobytes())
+    return h.hexdigest()
+
+
 def load_catalog(json_path: str) -> List[Dict[str, Any]]:
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -50,23 +61,6 @@ def _genres_to_str(genres_val: Any) -> str:
     if isinstance(genres_val, dict) and "Name" in genres_val:
         return str(genres_val.get("Name") or "")
     return ""
-
-
-def genres_to_list(genres_val: Any) -> List[str]:
-    if isinstance(genres_val, list):
-        out: List[str] = []
-        for g in genres_val:
-            if isinstance(g, dict) and "Name" in g and g["Name"] is not None:
-                out.append(str(g["Name"]))
-            elif g is not None:
-                out.append(str(g))
-        return out
-    if isinstance(genres_val, str):
-        return [genres_val] if genres_val else []
-    if isinstance(genres_val, dict) and "Name" in genres_val:
-        name = genres_val.get("Name")
-        return [str(name)] if name else []
-    return []
 
 
 def generate_embeddings(
@@ -123,41 +117,34 @@ def generate_embeddings(
     if not ids:
         return {}, {}
 
-    cached_vectors: Dict[str, NDArray[np.float32]] = {}
-    cached_hashes: Dict[str, str] = {}
+    cached_ids_arr: Optional[np.ndarray] = None
+    cached_emb: Optional[np.ndarray] = None
+    cached_h: Optional[np.ndarray] = None
     if os.path.exists(cache_path):
         try:
             with np.load(cache_path, allow_pickle=False, mmap_mode="r") as npz:
-                cached_ids = npz["ids"].astype(str)
+                cached_ids_arr = npz["ids"].astype(str).tolist()
                 cached_emb = np.asarray(npz["embeddings"], dtype=np.float32)
                 cached_h = npz["hashes"].astype(str)
-                
-                # UYGULANAN DÜZELTME (Madde 1.4): Kısmi veya eski önbelleği kontrol et.
-                # Eğer önbellekteki ID seti, güncel katalogdaki ID setiyle tam olarak
-                # eşleşmiyorsa, önbelleği geçersiz say.
-                if set(cached_ids) == set(ids):
-                    for i, cid in enumerate(cached_ids):
-                        cached_vectors[cid] = cached_emb[i]
-                        cached_hashes[cid] = cached_h[i]
-                    if cached_emb is not None:
-                        embedding_dim = int(cached_emb.shape[1])
-                else:
-                    print("Cache is stale (ID mismatch). Recomputing all embeddings.")
-                    cached_vectors = {}
-                    cached_hashes = {}
+                if cached_emb is not None:
+                    embedding_dim = int(cached_emb.shape[1])
         except Exception:
-            # Önbellek bozuksa, yok say ve devam et
-            cached_vectors = {}
-            cached_hashes = {}
+            cached_ids_arr = None
+            cached_emb = None
+            cached_h = None
 
     to_compute_indices: List[int] = []
     reused_vectors: Dict[int, NDArray[np.float32]] = {}
-    for i, item_id in enumerate(ids):
-        prev_h = cached_hashes.get(item_id)
-        if prev_h is not None and prev_h == item_hashes[i] and item_id in cached_vectors:
-            reused_vectors[i] = cached_vectors[item_id]
-        else:
-            to_compute_indices.append(i)
+    if cached_ids_arr is not None and cached_emb is not None and cached_h is not None:
+        id_to_pos = {str(cid): i for i, cid in enumerate(cached_ids_arr)}
+        for i, item_id in enumerate(ids):
+            pos = id_to_pos.get(item_id)
+            if pos is not None and cached_h[pos] == item_hashes[i]:
+                reused_vectors[i] = cached_emb[pos]
+            else:
+                to_compute_indices.append(i)
+    else:
+        to_compute_indices = list(range(len(ids)))
 
     model = None
     if to_compute_indices:
@@ -217,25 +204,29 @@ def generate_embeddings(
     return embeddings, id_to_item
 
 
-def _build_or_load_ann(json_path: str, embeddings: Dict[str, NDArray[np.float32]]) -> Tuple[Any, List[str]]:
-    # UYGULANAN DÜZELTME (Madde 1.3): ID'ler sıralanarak önbellek tutarlılığı sağlanır.
-    # Bu, FAISS indeksinin ve ID listesinin her zaman aynı sırada olmasını garanti eder.
+def _build_or_load_ann(cache_path: str, embeddings: Dict[str, NDArray[np.float32]]) -> Tuple[Any, List[str]]:
     ids = sorted(embeddings.keys())
-    
     if not ids:
         return None, []
-    _, ann_path, ids_path = _cache_paths(json_path)
+    base, _ = os.path.splitext(cache_path)
+    ann_path = base + "_ann.faiss"
+    ids_path = base + "_ann_ids.npy"
+    meta_path = _ann_meta_path_from_cache_path(cache_path)
     mat = np.stack([embeddings[i] for i in ids], axis=0).astype(np.float32)
     if faiss is None:
         return None, ids
     d = mat.shape[1]
-    if os.path.exists(ann_path) and os.path.exists(ids_path):
+    digest = _matrix_digest(mat)
+    if os.path.exists(ann_path) and os.path.exists(ids_path) and os.path.exists(meta_path):
         try:
             saved_ids = np.load(ids_path, allow_pickle=False).astype(str).tolist()
             if saved_ids == ids:
                 index = faiss.read_index(ann_path)
-                if getattr(index, "d", None) == d:
-                    return index, saved_ids
+                if getattr(index, "d", None) == d and getattr(index, "ntotal", None) == len(ids):
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    if meta.get("digest") == digest:
+                        return index, saved_ids
         except Exception:
             pass
     index = faiss.IndexFlatIP(d)
@@ -243,6 +234,8 @@ def _build_or_load_ann(json_path: str, embeddings: Dict[str, NDArray[np.float32]
     try:
         faiss.write_index(index, ann_path)
         np.save(ids_path, np.array(ids))
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump({"digest": digest, "d": d, "count": len(ids)}, f)
     except Exception:
         pass
     return index, ids
@@ -281,7 +274,18 @@ def get_embedding_based_recommendations(
         item_data = id_to_item.get(iid, {})
         title = str(item_data.get("Title") or item_data.get("title") or "")
         
-        genres_list: List[str] = genres_to_list(item_data.get("Genres"))
+        genres_val = item_data.get("Genres")
+        genres_list: List[str] = []
+        if isinstance(genres_val, list):
+            for g in genres_val:
+                if isinstance(g, dict) and "Name" in g and g["Name"] is not None:
+                    genres_list.append(str(g["Name"]))
+                elif g is not None:
+                    genres_list.append(str(g))
+        elif isinstance(genres_val, str):
+            genres_list = [genres_val] if genres_val else []
+        elif isinstance(genres_val, dict) and "Name" in genres_val:
+            genres_list = [str(genres_val.get("Name"))] if genres_val.get("Name") else []
         
         results.append({
             "Id": iid,
@@ -297,11 +301,11 @@ def get_embedding_based_recommendations_ann(
     id_to_item: Dict[str, Dict[str, Any]],
     embeddings: Dict[str, NDArray[np.float32]],
     k: int,
-    json_path: str,
+    cache_path: str,
 ) -> List[Dict[str, Any]]:
     if seed_id not in embeddings:
         raise ValueError(f"seed_id '{seed_id}' not found in embeddings.")
-    ann_index, ann_ids = _build_or_load_ann(json_path, embeddings)
+    ann_index, ann_ids = _build_or_load_ann(cache_path, embeddings)
     if ann_index is None or len(ann_ids) != len(embeddings):
         return get_embedding_based_recommendations(seed_id, id_to_item, embeddings, k=k)
     
@@ -319,7 +323,18 @@ def get_embedding_based_recommendations_ann(
             
         item_data = id_to_item.get(iid, {})
         title = str(item_data.get("Title") or item_data.get("title") or "")
-        genres_list: List[str] = genres_to_list(item_data.get("Genres"))
+        genres_val = item_data.get("Genres")
+        genres_list: List[str] = []
+        if isinstance(genres_val, list):
+            for g in genres_val:
+                if isinstance(g, dict) and "Name" in g and g["Name"] is not None:
+                    genres_list.append(str(g["Name"]))
+                elif g is not None:
+                    genres_list.append(str(g))
+        elif isinstance(genres_val, str):
+            genres_list = [genres_val] if genres_val else []
+        elif isinstance(genres_val, dict) and "Name" in genres_val:
+            genres_list = [str(genres_val.get("Name"))] if genres_val.get("Name") else []
             
         results.append({
             "Id": iid,
@@ -339,7 +354,7 @@ def evaluate_recommender(
     id_to_item: Dict[str, Dict[str, Any]],
     interactions_path: str,
     k: int = 10,
-    json_path: str | None = None,
+    cache_path: Optional[str] = None,
 ) -> None:
     col_names = [
         "profileid", "contentid", "contenttype", "timestamp",
@@ -349,8 +364,8 @@ def evaluate_recommender(
     ann_index = None
     ann_ids: List[str] = []
     use_ann = False
-    if json_path is not None:
-        ann_index, ann_ids = _build_or_load_ann(json_path, embeddings)
+    if cache_path is not None:
+        ann_index, ann_ids = _build_or_load_ann(cache_path, embeddings)
         use_ann = ann_index is not None and len(ann_ids) == len(embeddings)
 
     df = pd.read_csv(interactions_path, header=None, names=col_names)
@@ -392,13 +407,8 @@ def evaluate_recommender(
 
         if seed_id not in embeddings:
             continue
-
-        # UYGULANAN DÜZELTME (Madde 1.6): "İlgili" öğeleri, sadece katalogda
-        # (ve dolayısıyla embedding'i olanlar) var olanlarla sınırla.
-        # Bu, metriklerin doğru hesaplanmasını sağlar.
         relevant_in_catalog = relevant.intersection(embeddings.keys())
         if not relevant_in_catalog:
-            # Değerlendirilecek geçerli bir öğe yoksa bu kullanıcıyı atla
             continue
 
         if use_ann and ann_index is not None:
@@ -475,12 +485,13 @@ def main():
         raise RuntimeError("No embeddings were generated. Check that items have Title and/or Genres.")
 
     if args.interactions:
+        cache_path, _, _ = _cache_paths(args.data)
         evaluate_recommender(
             embeddings=embeddings,
             id_to_item=id_to_item,
             interactions_path=args.interactions,
             k=args.k,
-            json_path=args.data,
+            cache_path=cache_path,
         )
         if args.save:
             ids = list(embeddings.keys())
@@ -491,12 +502,13 @@ def main():
 
     seed_id = args.seed or pick_default_seed(embeddings)
 
+    cache_path, _, _ = _cache_paths(args.data)
     recs = get_embedding_based_recommendations_ann(
         seed_id=seed_id,
         id_to_item=id_to_item,
         embeddings=embeddings,
         k=args.k,
-        json_path=args.data,
+        cache_path=cache_path,
     )
 
     seed_title = id_to_item.get(seed_id, {}).get("Title", "N/A")
@@ -524,3 +536,4 @@ if __name__ == "__main__":
     finally:
         elapsed = time.perf_counter() - start_time
         print(f"\nElapsed time: {elapsed:.3f}s")
+
