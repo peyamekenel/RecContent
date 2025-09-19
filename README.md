@@ -4,7 +4,7 @@ This repository provides a simple content-based recommendation system using sent
 
 ## Features:
 - **Weighted Embeddings:** Combines embeddings from **Genres (0.6 weight)** and **Description (0.4 weight)**. The `Description` field often incorporates the `Title` if a separate `Description` is not available. Embeddings are L2 normalized per-item.
-- **Cosine Similarity / ANN:** Uses cosine/inner-product similarity; automatically leverages FAISS ANN if available.
+- FAISS-only ANN: Uses FAISS inner-product search exclusively for retrieval (no brute-force fallback).
 - **Dynamic Cache:** A cache file (e.g., `your_data_name_embedding_cache.npz`) is created *next to your input `--data` JSON file*. This cache stores per-item embeddings and hashes, skipping re-embedding for unchanged items.
 - **Cache Invalidation:** The cache automatically invalidates when `Description`, `Genres`, model name, or embedding weights change.
 - **Outputs:** Recommendations include Id, Title, Genres, and Score.
@@ -18,7 +18,7 @@ This repository provides a simple content-based recommendation system using sent
    source .venv/bin/activate
    pip install -r requirements.txt
    ```
-   FAISS is optional and auto-detected. If you want ANN speed-ups, install `faiss-cpu`.
+   FAISS is required. Ensure `faiss-cpu` is installed.
 
 2) **Data:**
    Provide a JSON file similar to `all 1.json` (either a list of items or an object like `{"items": [...]}`) with the following keys:
@@ -83,6 +83,6 @@ Then, you can run the script in different modes. You can call either entrypoint:
 - It is used both for:
   - Single-seed recommend: python main.py --data "/path/to/all+1.json" --k 10
   - Evaluation: python main.py --data "/path/to/all+1.json" --interactions "/path/to/interactions.csv" --k 10
-- If FAISS is unavailable, the script automatically falls back to exact similarity without the index.
+- If FAISS is unavailable or the index cannot be built, the script will raise an error guiding you to install `faiss-cpu`.
 
 ---
