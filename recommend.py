@@ -45,6 +45,70 @@ def load_catalog(json_path: str) -> List[Dict[str, Any]]:
     if isinstance(data, list):
         return data
     raise ValueError(f"Unsupported JSON structure in {json_path}. Expected a list or an object with key 'items' being a list.")
+def get_title(item: Dict[str, Any]) -> str:
+    return str(item.get("Title") or item.get("title") or "")
+
+def get_genres_list(item: Dict[str, Any]) -> List[str]:
+    genres_val = item.get("Genres")
+    genres_list: List[str] = []
+    if isinstance(genres_val, list):
+        for g in genres_val:
+            if isinstance(g, dict) and "Name" in g and g["Name"] is not None:
+                genres_list.append(str(g["Name"]))
+            elif g is not None:
+                genres_list.append(str(g))
+    elif isinstance(genres_val, str):
+        genres_list = [genres_val] if genres_val else []
+    elif isinstance(genres_val, dict) and "Name" in genres_val:
+        if genres_val.get("Name"):
+            genres_list = [str(genres_val.get("Name"))]
+    return genres_list
+
+def ann_topk_ids(
+    embeddings: Dict[str, NDArray[np.float32]],
+    ann_index: "faiss.Index",
+    ann_ids: List[str],
+    seed_id: str,
+    k: int,
+) -> List[str]:
+    seed_vec = embeddings[seed_id].astype(np.float32).reshape(1, -1)
+    D, I = ann_index.search(seed_vec, min(k + 1, len(ann_ids)))
+    idxs = [i for i in I[0].tolist() if i >= 0]
+    rec_ids: List[str] = []
+    for idx in idxs:
+        iid = ann_ids[idx]
+        if iid != seed_id:
+            rec_ids.append(iid)
+        if len(rec_ids) >= k:
+            break
+    return rec_ids
+
+def ann_topk_with_scores(
+    embeddings: Dict[str, NDArray[np.float32]],
+    ann_index: "faiss.Index",
+    ann_ids: List[str],
+    seed_id: str,
+    k: int,
+) -> List[Tuple[str, float]]:
+    seed_vec = embeddings[seed_id].astype(np.float32).reshape(1, -1)
+    D, I = ann_index.search(seed_vec, min(k + 1, len(ann_ids)))
+    results: List[Tuple[str, float]] = []
+    for idx, score in zip(I[0], D[0]):
+        if idx < 0:
+            continue
+        iid = ann_ids[idx]
+        if iid == seed_id:
+            continue
+        results.append((iid, float(score)))
+        if len(results) >= k:
+            break
+    return results
+
+def save_embeddings(path: str, embeddings: Dict[str, NDArray[np.float32]]) -> None:
+    ids = list(embeddings.keys())
+    mat = np.stack([embeddings[i] for i in ids], axis=0)
+    np.savez_compressed(path, ids=np.array(ids), embeddings=mat)
+
 
 
 def _genres_to_str(genres_val: Any) -> str:
@@ -257,42 +321,13 @@ def get_embedding_based_recommendations_ann(
         raise RuntimeError("FAISS index is unavailable or inconsistent. Ensure 'faiss-cpu' is installed and rebuild the index.")
     
     seed_vec = embeddings[seed_id].astype(np.float32).reshape(1, -1)
-    D, I = ann_index.search(seed_vec, min(k + 1, len(ann_ids)))
-    
+    pairs = ann_topk_with_scores(embeddings, ann_index, ann_ids, seed_id, k)
     results: List[Dict[str, Any]] = []
-    for idx, score in zip(I[0], D[0]):
-        if idx < 0:
-            continue
-            
-        iid = ann_ids[idx]
-        if iid == seed_id:
-            continue
-            
+    for iid, score in pairs:
         item_data = id_to_item.get(iid, {})
-        title = str(item_data.get("Title") or item_data.get("title") or "")
-        genres_val = item_data.get("Genres")
-        genres_list: List[str] = []
-        if isinstance(genres_val, list):
-            for g in genres_val:
-                if isinstance(g, dict) and "Name" in g and g["Name"] is not None:
-                    genres_list.append(str(g["Name"]))
-                elif g is not None:
-                    genres_list.append(str(g))
-        elif isinstance(genres_val, str):
-            genres_list = [genres_val] if genres_val else []
-        elif isinstance(genres_val, dict) and "Name" in genres_val:
-            genres_list = [str(genres_val.get("Name"))] if genres_val.get("Name") else []
-            
-        results.append({
-            "Id": iid,
-            "Title": title,
-            "Genres": genres_list,
-            "Score": float(score),
-        })
-        
-        if len(results) >= k:
-            break
-            
+        title = get_title(item_data)
+        genres_list = get_genres_list(item_data)
+        results.append({"Id": iid, "Title": title, "Genres": genres_list, "Score": float(score)})
     return results
 
 
@@ -355,16 +390,7 @@ def evaluate_recommender(
         if not relevant_in_catalog:
             continue
 
-        seed_vec = embeddings[seed_id].astype(np.float32).reshape(1, -1)
-        D, I = ann_index.search(seed_vec, min(k + 1, len(ann_ids)))
-        idxs = [i for i in I[0].tolist() if i >= 0]
-        rec_ids = []
-        for idx in idxs:
-            iid = ann_ids[idx]
-            if iid != seed_id:
-                rec_ids.append(iid)
-            if len(rec_ids) >= k:
-                break
+        rec_ids = ann_topk_ids(embeddings, ann_index, ann_ids, seed_id, k)
 
         hits = sum(1 for rid in rec_ids if rid in relevant_in_catalog)
         prec = hits / float(k) if k > 0 else 0.0
@@ -434,9 +460,7 @@ def main():
             cache_path=cache_path,
         )
         if args.save:
-            ids = list(embeddings.keys())
-            mat = np.stack([embeddings[i] for i in ids], axis=0)
-            np.savez_compressed(args.save, ids=np.array(ids), embeddings=mat)
+            save_embeddings(args.save, embeddings)
             print(f"Saved embeddings to: {args.save}")
         return
 
@@ -463,9 +487,7 @@ def main():
         print(f"- Id: {r['Id']:<10} | Title: {r['Title']:<40} | Genres: {genres_str:<30} | Score: {r['Score']:.5f}")
 
     if args.save:
-        ids = list(embeddings.keys())
-        mat = np.stack([embeddings[i] for i in ids], axis=0)
-        np.savez_compressed(args.save, ids=np.array(ids), embeddings=mat)
+        save_embeddings(args.save, embeddings)
         print(f"Saved embeddings to: {args.save}")
 
 
