@@ -63,6 +63,22 @@ Then, you can run the script in different modes. You can call either entrypoint:
    ```bash
    python main.py --data "/path/to/all+1.json" --model-name sentence-transformers/all-MPNet-base-v2 --genre-weight 0.6 --desc-weight 0.4
    ```
+**3. Personalized User-Based Recommendations:**
+   ```bash
+   python main.py --data "/path/to/all+1.json" --interactions "/path/to/interactions.csv" --user-id 12345 --k 10
+   ```
+   - Builds a user profile by averaging embeddings of all items the user interacted with.
+   - The profile is L2-normalized and queried against the FAISS index.
+   - Items already seen by the user are filtered out; top-k unseen items are returned.
+
+**4. Temporal Evaluation (next-item prediction):**
+   ```bash
+   python main.py --data "/path/to/all+1.json" --interactions "/path/to/interactions.csv" --k 10 --evaluate-temporal
+   ```
+   - For users with at least two interactions, sorts their history by timestamp.
+   - Uses all but the most recent interaction to build the user profile (train), and the most recent as the test item.
+   - Reports averaged Precision@k, Recall@k, and NDCG@k across evaluated users.
+
 
 **2. Evaluate Recommender Performance (using interactions data):**
    ```bash

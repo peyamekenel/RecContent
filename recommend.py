@@ -103,6 +103,30 @@ def ann_topk_with_scores(
         if len(results) >= k:
             break
     return results
+def ann_query_vector_with_scores(
+    query_vec: NDArray[np.float32],
+    ann_index: "faiss.Index",
+    ann_ids: List[str],
+    k: int,
+    exclude: Optional[set] = None,
+    overfetch: int = 0,
+) -> List[Tuple[str, float]]:
+    q = query_vec.astype(np.float32).reshape(1, -1)
+    fetch_n = min(max(k + (overfetch if overfetch > 0 else 0), k), len(ann_ids))
+    D, I = ann_index.search(q, fetch_n)
+    results: List[Tuple[str, float]] = []
+    excluded = exclude or set()
+    for idx, score in zip(I[0], D[0]):
+        if idx < 0:
+            continue
+        iid = ann_ids[idx]
+        if iid in excluded:
+            continue
+        results.append((iid, float(score)))
+        if len(results) >= k:
+            break
+    return results
+
 
 def save_embeddings(path: str, embeddings: Dict[str, NDArray[np.float32]]) -> None:
     ids = list(embeddings.keys())
@@ -328,6 +352,73 @@ def get_embedding_based_recommendations_ann(
         genres_list = get_genres_list(item_data)
         results.append({"Id": iid, "Title": title, "Genres": genres_list, "Score": float(score)})
     return results
+def build_user_profile_vector_from_interactions(
+    user_id: str,
+    interactions_path: str,
+    embeddings: Dict[str, NDArray[np.float32]],
+) -> Tuple[Optional[NDArray[np.float32]], set]:
+    col_names = [
+        "profileid", "contentid", "contenttype", "timestamp",
+        "episodecount", "wathcedcount", "applicationid", "deviceid",
+        "lang", "country",
+    ]
+    df = pd.read_csv(interactions_path, header=None, names=col_names, usecols=["profileid", "contentid"])
+    df = df.dropna()
+    df["profileid"] = df["profileid"].astype(str)
+    df["contentid"] = df["contentid"].astype(str)
+
+    user_df = df[df["profileid"] == str(user_id)]
+    seen_ids = set(user_df["contentid"].tolist())
+    if user_df.empty:
+        return None, set()
+
+    vecs: List[NDArray[np.float32]] = []
+    for cid in seen_ids:
+        v = embeddings.get(cid)
+        if v is not None:
+            vecs.append(v.astype(np.float32))
+
+    if not vecs:
+        return None, seen_ids
+
+    mat = np.stack(vecs, axis=0)
+    prof = np.mean(mat, axis=0)
+    norm = np.linalg.norm(prof)
+    if norm > 0:
+        prof = prof / norm
+    return prof.astype(np.float32), seen_ids
+
+def get_user_based_recommendations_ann(
+    user_id: str,
+    interactions_path: str,
+    id_to_item: Dict[str, Dict[str, Any]],
+    embeddings: Dict[str, NDArray[np.float32]],
+    k: int,
+    cache_path: str,
+) -> List[Dict[str, Any]]:
+    ann_index, ann_ids = _build_or_load_ann(cache_path, embeddings)
+    if ann_index is None or len(ann_ids) != len(embeddings):
+        raise RuntimeError("FAISS index is unavailable or inconsistent. Ensure 'faiss-cpu' is installed and rebuild the index.")
+
+    user_vec, seen_ids = build_user_profile_vector_from_interactions(
+        user_id=user_id,
+        interactions_path=interactions_path,
+        embeddings=embeddings,
+    )
+    if user_vec is None:
+        raise ValueError(f"Cannot build user profile: no valid interactions found in catalog for user '{user_id}'.")
+
+    overfetch = min(len(seen_ids), max(k, 50))
+    pairs = ann_query_vector_with_scores(user_vec, ann_index, ann_ids, k=k, exclude=seen_ids, overfetch=overfetch)
+
+    results: List[Dict[str, Any]] = []
+    for iid, score in pairs:
+        item_data = id_to_item.get(iid, {})
+        title = get_title(item_data)
+        genres_list = get_genres_list(item_data)
+        results.append({"Id": iid, "Title": title, "Genres": genres_list, "Score": float(score)})
+    return results
+
 
 
 def evaluate_recommender(
@@ -417,6 +508,93 @@ def evaluate_recommender(
     print(f"- Recall@{k}:    {avg_r:.4f}")
     print(f"- NDCG@{k}:      {avg_n:.4f}")
 
+def evaluate_user_recommender_temporal(
+    embeddings: Dict[str, NDArray[np.float32]],
+    id_to_item: Dict[str, Dict[str, Any]],
+    interactions_path: str,
+    k: int = 10,
+    cache_path: Optional[str] = None,
+) -> None:
+    col_names = [
+        "profileid", "contentid", "contenttype", "timestamp",
+        "episodecount", "wathcedcount", "applicationid", "deviceid",
+        "lang", "country",
+    ]
+    usecols = ["profileid", "contentid", "timestamp"]
+    df = pd.read_csv(interactions_path, header=None, names=col_names, usecols=usecols).dropna()
+    df["profileid"] = df["profileid"].astype(str)
+    df["contentid"] = df["contentid"].astype(str)
+    df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["timestamp"])
+
+    if cache_path is None:
+        cache_path, _, _ = _cache_paths(interactions_path)
+    ann_index, ann_ids = _build_or_load_ann(cache_path, embeddings)
+
+    def dcg_single(rec_ids: List[str], target: str, k: int) -> float:
+        try:
+            pos = rec_ids.index(target)
+            if pos < k:
+                return 1.0 / math.log2((pos + 1) + 1)
+        except ValueError:
+            pass
+        return 0.0
+
+    precisions: List[float] = []
+    recalls: List[float] = []
+    ndcgs: List[float] = []
+    users_evaluated = 0
+
+    for uid, g in df.groupby("profileid"):
+        g_sorted = g.sort_values("timestamp", ascending=True)
+        if len(g_sorted) < 2:
+            continue
+
+        train = g_sorted.iloc[:-1]["contentid"].tolist()
+        test_item = g_sorted.iloc[-1]["contentid"]
+
+        vecs = [embeddings[cid].astype(np.float32) for cid in train if cid in embeddings]
+        if not vecs:
+            continue
+        test_in_catalog = test_item in embeddings
+
+        mat = np.stack(vecs, axis=0)
+        prof = np.mean(mat, axis=0)
+        norm = np.linalg.norm(prof)
+        if norm > 0:
+            prof = prof / norm
+        prof = prof.astype(np.float32)
+
+        exclude = set(train)
+        overfetch = min(len(exclude), max(k, 50))
+        pairs = ann_query_vector_with_scores(prof, ann_index, ann_ids, k=k, exclude=exclude, overfetch=overfetch)
+        rec_ids = [iid for iid, _ in pairs]
+
+        if test_in_catalog:
+            hit = 1 if test_item in rec_ids[:k] else 0
+            prec = hit / float(k) if k > 0 else 0.0
+            rec = float(hit)
+            dcg_val = dcg_single(rec_ids, test_item, k)
+            ndcg = dcg_val
+            precisions.append(prec)
+            recalls.append(rec)
+            ndcgs.append(ndcg)
+            users_evaluated += 1
+
+    if users_evaluated == 0:
+        print("No eligible users for temporal evaluation (need >=2 interactions with in-catalog items).")
+        return
+
+    avg_p = float(np.mean(precisions)) if precisions else 0.0
+    avg_r = float(np.mean(recalls)) if recalls else 0.0
+    avg_n = float(np.mean(ndcgs)) if ndcgs else 0.0
+
+    print("Temporal Evaluation summary (averaged across users):")
+    print(f"- Users evaluated: {users_evaluated}")
+    print(f"- Precision@{k}: {avg_p:.4f}")
+    print(f"- Recall@{k}:    {avg_r:.4f}")
+    print(f"- NDCG@{k}:      {avg_n:.4f}")
+
 
 def pick_default_seed(embeddings: Dict[str, NDArray[np.float32]]) -> str:
     for iid in sorted(embeddings.keys()):
@@ -430,7 +608,9 @@ def main():
     parser.add_argument("--seed", required=False, help="Seed item Id. If not provided, picks the first available.")
     parser.add_argument("--k", type=int, default=10, help="Number of recommendations to return.")
     parser.add_argument("--save", required=False, help="Optional path to save computed embeddings as .npz.")
-    parser.add_argument("--interactions", required=False, help="Path to interactions CSV (no header). When provided, run evaluation mode.")
+    parser.add_argument("--interactions", required=False, help="Path to interactions CSV (no header). When provided, run evaluation mode or build user profiles.")
+    parser.add_argument("--user-id", required=False, help="User ID for personalized recommendations (requires --interactions).")
+    parser.add_argument("--evaluate-temporal", action="store_true", help="Use temporal split evaluation instead of random seed eval.")
     parser.add_argument("--model-name", required=False, default="sentence-transformers/all-MPNet-base-v2", help="SentenceTransformer model to use.")
     parser.add_argument("--genre-weight", type=float, default=0.6, help="Weight for genre embeddings.")
     parser.add_argument("--desc-weight", type=float, default=0.4, help="Weight for description embeddings.")
@@ -448,7 +628,21 @@ def main():
     if not embeddings:
         raise RuntimeError("No embeddings were generated. Check that items have Title and/or Genres.")
 
-    if args.interactions:
+    if args.interactions and args.evaluate_temporal:
+        cache_path, _, _ = _cache_paths(args.data)
+        evaluate_user_recommender_temporal(
+            embeddings=embeddings,
+            id_to_item=id_to_item,
+            interactions_path=args.interactions,
+            k=args.k,
+            cache_path=cache_path,
+        )
+        if args.save:
+            save_embeddings(args.save, embeddings)
+            print(f"Saved embeddings to: {args.save}")
+        return
+
+    if args.interactions and not args.user_id:
         cache_path, _, _ = _cache_paths(args.data)
         evaluate_recommender(
             embeddings=embeddings,
@@ -457,6 +651,29 @@ def main():
             k=args.k,
             cache_path=cache_path,
         )
+        if args.save:
+            save_embeddings(args.save, embeddings)
+            print(f"Saved embeddings to: {args.save}")
+        return
+
+    if args.user_id:
+        if not args.interactions:
+            raise ValueError("--user-id requires --interactions to build the user profile.")
+        cache_path, _, _ = _cache_paths(args.data)
+        recs = get_user_based_recommendations_ann(
+            user_id=args.user_id,
+            interactions_path=args.interactions,
+            id_to_item=id_to_item,
+            embeddings=embeddings,
+            k=args.k,
+            cache_path=cache_path,
+        )
+        print(f"User-based recommendations for User: {args.user_id}")
+        print("Top recommendations:")
+        for r in recs:
+            genres_val = r.get("Genres", [])
+            genres_str = ", ".join(genres_val) if isinstance(genres_val, list) else str(genres_val)
+            print(f"- Id: {r['Id']:<10} | Title: {r['Title']:<40} | Genres: {genres_str:<30} | Score: {r['Score']:.5f}")
         if args.save:
             save_embeddings(args.save, embeddings)
             print(f"Saved embeddings to: {args.save}")
@@ -478,10 +695,7 @@ def main():
     print("Top recommendations:")
     for r in recs:
         genres_val = r.get("Genres", [])
-        if isinstance(genres_val, list):
-            genres_str = ", ".join(genres_val)
-        else:
-            genres_str = str(genres_val)
+        genres_str = ", ".join(genres_val) if isinstance(genres_val, list) else str(genres_val)
         print(f"- Id: {r['Id']:<10} | Title: {r['Title']:<40} | Genres: {genres_str:<30} | Score: {r['Score']:.5f}")
 
     if args.save:
