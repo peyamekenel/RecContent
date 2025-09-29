@@ -49,20 +49,7 @@ def get_title(item: Dict[str, Any]) -> str:
     return str(item.get("Title") or item.get("title") or "")
 
 def get_genres_list(item: Dict[str, Any]) -> List[str]:
-    genres_val = item.get("Genres")
-    genres_list: List[str] = []
-    if isinstance(genres_val, list):
-        for g in genres_val:
-            if isinstance(g, dict) and "Name" in g and g["Name"] is not None:
-                genres_list.append(str(g["Name"]))
-            elif g is not None:
-                genres_list.append(str(g))
-    elif isinstance(genres_val, str):
-        genres_list = [genres_val] if genres_val else []
-    elif isinstance(genres_val, dict) and "Name" in genres_val:
-        if genres_val.get("Name"):
-            genres_list = [str(genres_val.get("Name"))]
-    return genres_list
+    return _parse_genres(item.get("Genres"))
 
 def ann_topk_ids(
     embeddings: Dict[str, NDArray[np.float32]],
@@ -71,17 +58,28 @@ def ann_topk_ids(
     seed_id: str,
     k: int,
 ) -> List[str]:
+    res = _ann_topk_core(embeddings, ann_index, ann_ids, seed_id, k)
+    return [ann_ids[idx] for idx, _ in res]
+
+def _ann_topk_core(
+    embeddings: Dict[str, NDArray[np.float32]],
+    ann_index: "faiss.Index",
+    ann_ids: List[str],
+    seed_id: str,
+    k: int,
+) -> List[Tuple[int, float]]:
     seed_vec = embeddings[seed_id].astype(np.float32).reshape(1, -1)
     D, I = ann_index.search(seed_vec, min(k + 1, len(ann_ids)))
-    idxs = [i for i in I[0].tolist() if i >= 0]
-    rec_ids: List[str] = []
-    for idx in idxs:
-        iid = ann_ids[idx]
-        if iid != seed_id:
-            rec_ids.append(iid)
-        if len(rec_ids) >= k:
+    results: List[Tuple[int, float]] = []
+    for idx, score in zip(I[0].tolist(), D[0].tolist()):
+        if idx < 0:
+            continue
+        if ann_ids[idx] == seed_id:
+            continue
+        results.append((idx, float(score)))
+        if len(results) >= k:
             break
-    return rec_ids
+    return results
 
 def ann_topk_with_scores(
     embeddings: Dict[str, NDArray[np.float32]],
@@ -90,19 +88,8 @@ def ann_topk_with_scores(
     seed_id: str,
     k: int,
 ) -> List[Tuple[str, float]]:
-    seed_vec = embeddings[seed_id].astype(np.float32).reshape(1, -1)
-    D, I = ann_index.search(seed_vec, min(k + 1, len(ann_ids)))
-    results: List[Tuple[str, float]] = []
-    for idx, score in zip(I[0], D[0]):
-        if idx < 0:
-            continue
-        iid = ann_ids[idx]
-        if iid == seed_id:
-            continue
-        results.append((iid, float(score)))
-        if len(results) >= k:
-            break
-    return results
+    res = _ann_topk_core(embeddings, ann_index, ann_ids, seed_id, k)
+    return [(ann_ids[idx], score) for idx, score in res]
 
 def save_embeddings(path: str, embeddings: Dict[str, NDArray[np.float32]]) -> None:
     ids = list(embeddings.keys())
@@ -110,21 +97,25 @@ def save_embeddings(path: str, embeddings: Dict[str, NDArray[np.float32]]) -> No
     np.savez_compressed(path, ids=np.array(ids), embeddings=mat)
 
 
-
-def _genres_to_str(genres_val: Any) -> str:
+def _parse_genres(genres_val: Any) -> List[str]:
     if isinstance(genres_val, list):
-        names: List[str] = []
+        out: List[str] = []
         for g in genres_val:
             if isinstance(g, dict) and "Name" in g and g["Name"] is not None:
-                names.append(str(g["Name"]))
+                out.append(str(g["Name"]))
             elif g is not None:
-                names.append(str(g))
-        return ", ".join(names)
+                out.append(str(g))
+        return out
     if isinstance(genres_val, str):
-        return genres_val
+        return [genres_val] if genres_val else []
     if isinstance(genres_val, dict) and "Name" in genres_val:
-        return str(genres_val.get("Name") or "")
-    return ""
+        name = genres_val.get("Name")
+        return [str(name)] if name else []
+    return []
+
+
+def _genres_to_str(genres_val: Any) -> str:
+    return ", ".join(_parse_genres(genres_val))
 
 
 def generate_embeddings(
@@ -417,6 +408,67 @@ def evaluate_recommender(
     print(f"- Recall@{k}:    {avg_r:.4f}")
     print(f"- NDCG@{k}:      {avg_n:.4f}")
 
+class ContentRecommender:
+    def __init__(self):
+        self.embeddings: Dict[str, NDArray[np.float32]] = {}
+        self.id_to_item: Dict[str, Dict[str, Any]] = {}
+        self.cache_path: Optional[str] = None
+        self.ann_index: Optional["faiss.Index"] = None
+        self.ann_ids: List[str] = []
+
+    def fit(
+        self,
+        catalog_path: str,
+        model_name: str = "sentence-transformers/all-MPNet-base-v2",
+        genre_weight: float = 0.6,
+        desc_weight: float = 0.4,
+    ) -> "ContentRecommender":
+        catalog = load_catalog(catalog_path)
+        self.embeddings, self.id_to_item = generate_embeddings(
+            catalog,
+            json_path=catalog_path,
+            model_name=model_name,
+            genre_weight=genre_weight,
+            description_weight=desc_weight,
+        )
+        if not self.embeddings:
+            raise RuntimeError("No embeddings were generated. Check that items have Title and/or Genres.")
+        self.cache_path, _, _ = _cache_paths(catalog_path)
+        self.ann_index, self.ann_ids = _build_or_load_ann(self.cache_path, self.embeddings)
+        return self
+
+    def recommend(self, seed_id: Optional[str], k: int) -> List[Dict[str, Any]]:
+        if not self.embeddings or self.ann_index is None:
+            raise RuntimeError("Model not fitted. Call .fit() first.")
+        sid = seed_id or pick_default_seed(self.embeddings)
+        pairs = ann_topk_with_scores(self.embeddings, self.ann_index, self.ann_ids, sid, k)
+        results: List[Dict[str, Any]] = []
+        for iid, score in pairs:
+            item_data = self.id_to_item.get(iid, {})
+            results.append({
+                "Id": iid,
+                "Title": get_title(item_data),
+                "Genres": get_genres_list(item_data),
+                "Score": float(score),
+            })
+        return results
+
+    def evaluate(self, interactions_path: str, k: int) -> None:
+        if not self.embeddings or self.ann_index is None:
+            raise RuntimeError("Model not fitted. Call .fit() first.")
+        evaluate_recommender(
+            embeddings=self.embeddings,
+            id_to_item=self.id_to_item,
+            interactions_path=interactions_path,
+            k=k,
+            cache_path=self.cache_path,
+        )
+
+    def save_embeddings(self, path: str) -> None:
+        if not self.embeddings:
+            raise RuntimeError("No embeddings to save; call .fit() first.")
+        save_embeddings(path, self.embeddings)
+
 
 def pick_default_seed(embeddings: Dict[str, NDArray[np.float32]]) -> str:
     for iid in sorted(embeddings.keys()):
@@ -436,44 +488,24 @@ def main():
     parser.add_argument("--desc-weight", type=float, default=0.4, help="Weight for description embeddings.")
     args = parser.parse_args()
 
-    catalog = load_catalog(args.data)
-    embeddings, id_to_item = generate_embeddings(
-        catalog,
-        json_path=args.data,
+    rec = ContentRecommender().fit(
+        catalog_path=args.data,
         model_name=args.model_name,
         genre_weight=args.genre_weight,
-        description_weight=args.desc_weight,
+        desc_weight=args.desc_weight,
     )
 
-    if not embeddings:
-        raise RuntimeError("No embeddings were generated. Check that items have Title and/or Genres.")
-
     if args.interactions:
-        cache_path, _, _ = _cache_paths(args.data)
-        evaluate_recommender(
-            embeddings=embeddings,
-            id_to_item=id_to_item,
-            interactions_path=args.interactions,
-            k=args.k,
-            cache_path=cache_path,
-        )
+        rec.evaluate(args.interactions, k=args.k)
         if args.save:
-            save_embeddings(args.save, embeddings)
+            rec.save_embeddings(args.save)
             print(f"Saved embeddings to: {args.save}")
         return
 
-    seed_id = args.seed or pick_default_seed(embeddings)
+    seed_id = args.seed or pick_default_seed(rec.embeddings)
+    recs = rec.recommend(seed_id=seed_id, k=args.k)
 
-    cache_path, _, _ = _cache_paths(args.data)
-    recs = get_embedding_based_recommendations_ann(
-        seed_id=seed_id,
-        id_to_item=id_to_item,
-        embeddings=embeddings,
-        k=args.k,
-        cache_path=cache_path,
-    )
-
-    seed_title = id_to_item.get(seed_id, {}).get("Title", "N/A")
+    seed_title = rec.id_to_item.get(seed_id, {}).get("Title", "N/A")
     print(f"Seed Item: '{seed_title}' (Id: {seed_id})")
     print("Top recommendations:")
     for r in recs:
@@ -485,7 +517,7 @@ def main():
         print(f"- Id: {r['Id']:<10} | Title: {r['Title']:<40} | Genres: {genres_str:<30} | Score: {r['Score']:.5f}")
 
     if args.save:
-        save_embeddings(args.save, embeddings)
+        rec.save_embeddings(args.save)
         print(f"Saved embeddings to: {args.save}")
 
 
